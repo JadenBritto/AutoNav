@@ -20,8 +20,9 @@ CLASSES
 -------
   SimulationEnv  – World grid, obstacle management, rendering primitives
   Sensor         – 360° LIDAR ray-caster
-  PathFinder     – A* search with Manhattan heuristic
+  PathFinder     – A* search with Octile heuristic (8-directional)
   Vehicle        – Movement controller, telemetry, integration hub
+  HUD            – Real-time telemetry sidebar renderer
   Simulation     – Main loop & event orchestration
 """
 
