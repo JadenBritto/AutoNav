@@ -116,7 +116,8 @@ C_ACCENT     = ( 80, 160, 255)
 # ── Vehicle / sensor tuning ─────────────────────────────────────────────────
 VEHICLE_SPEED     = 3.5          # pixels per frame
 SENSOR_RANGE      = 5            # cells
-SAFETY_THRESHOLD  = 1.5          # cells – halt distance in front
+SAFETY_THRESHOLD  = 0.7          # cells – halt distance in front (< 1 so
+                                  #          1-wide gaps don't false-trigger)
 RECALC_COOLDOWN   = 0.4          # seconds between forced recalculations
 RAY_ANGLES_DEG    = [0, 45, 90, 135, 180, 225, 270, 315]   # 360° at 45° steps
 
@@ -438,9 +439,24 @@ class Sensor:
     # ── Query helpers ───────────────────────────────────────────────────────
 
     def front_distance(self, heading_deg: float) -> float:
-        """Return sensor reading closest to the vehicle's heading."""
-        # Find the angle in our set closest to heading
-        best = min(self.angles_deg, key=lambda a: abs((a - heading_deg + 360) % 360))
+        """
+        Return the sensor reading for the ray closest to the vehicle heading,
+        BUT only if that ray is within ±22.5° of the heading (half of the 45°
+        step).  If the nearest ray is a diagonal that's actually ≥35° away,
+        it belongs to a side wall in a corridor – return inf so we don't halt.
+        """
+        best = min(
+            self.angles_deg,
+            key=lambda a: (a - heading_deg + 360) % 360
+            if (a - heading_deg + 360) % 360 <= 180
+            else 360 - (a - heading_deg + 360) % 360,
+        )
+        # Angular difference (0–180°)
+        diff = abs((best - heading_deg + 360) % 360)
+        if diff > 180:
+            diff = 360 - diff
+        if diff > 22.5:        # ray is not in the forward cone—ignore
+            return float('inf')
         d = self.readings[best]
         return d if d >= 0 else float('inf')
 
@@ -577,7 +593,17 @@ class Vehicle:
         # ── LIDAR scan ──────────────────────────────────────────────────────
         self.sensor.scan(self.px, self.py)
 
-        # ── Front-sensor safety check ────────────────────────────────────────
+        # ── Primary safety check: is the immediate next waypoint blocked? ──────
+        # This is the reliable way to catch user-placed obstacles on the path.
+        if self.path and self.path_index < len(self.path):
+            if self.env.is_blocked(*self.path[self.path_index]):
+                self.halted = True
+                self._recalculate_path()
+                return
+
+        # ── Secondary safety: forward sensor emergency halt ──────────────────
+        # Only fires when something appears very close along the heading ray
+        # (threshold is 0.7c so valid corridor walls never trigger this).
         front_dist = self.sensor.front_distance(self.heading)
         if 0 < front_dist < SAFETY_THRESHOLD:
             self.halted = True
