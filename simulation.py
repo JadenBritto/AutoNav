@@ -10,11 +10,14 @@
 
 CONTROLS
 --------
-  Left-click   → Place obstacle on grid
-  Right-click  → Remove obstacle from grid
-  R            → Reset vehicle to start & recalculate path
-  SPACE        → Pause / Resume simulation
-  ESC / Q      → Quit
+  Left-click         → Place obstacle  (in OBSTACLE mode)
+  Left-click         → Set target      (in TARGET mode)
+  Right-click        → Remove obstacle (any mode)
+  T                  → Toggle mode between OBSTACLE / TARGET
+  R                  → Reset vehicle to start & recalculate path
+  C                  → Clear all obstacles
+  SPACE              → Pause / Resume simulation
+  ESC / Q            → Quit
 
 CLASSES
 -------
@@ -39,19 +42,51 @@ import pygame
 # ---------------------------------------------------------------------------
 # ─── CONSTANTS ──────────────────────────────────────────────────────────────
 # ---------------------------------------------------------------------------
+# Screen dimensions are determined at runtime from the desktop resolution so
+# the simulation fills any laptop or external display automatically.
+# Call _init_display_constants() once after pygame.init() before using these.
 
-SCREEN_W: int = 880          # Window width  (px)
-SCREEN_H: int = 680          # Window height (px)
-CELL: int     = 40           # Grid cell size (px)
+HUD_W: int = 220          # sidebar width (px) – fixed
+FPS:   int = 60
 
-COLS: int = SCREEN_W // CELL
-ROWS: int = SCREEN_H // CELL
+# These are populated by _init_display_constants() at startup:
+SCREEN_W: int = 1280
+SCREEN_H: int = 720
+CELL:     int = 32
+COLS:     int = (SCREEN_W - HUD_W) // CELL
+ROWS:     int = SCREEN_H // CELL
+GRID_W:   int = COLS * CELL          # snapped to whole cells
 
-# HUD sidebar width in pixels (drawn on the right)
-HUD_W: int = 220
-GRID_W: int = SCREEN_W - HUD_W   # area used by the grid
 
-FPS: int = 60
+def _init_display_constants() -> None:
+    """
+    Query the primary monitor's usable resolution via pygame and update the
+    module-level layout constants so every class sees the correct values.
+    A small margin (48 px) is reserved for OS taskbars / title bars.
+    """
+    global SCREEN_W, SCREEN_H, CELL, COLS, ROWS, GRID_W
+
+    info = pygame.display.Info()          # works after pygame.display.init()
+    desk_w = info.current_w
+    desk_h = info.current_h
+
+    # Leave room for taskbar + window chrome
+    MARGIN   = 48
+    avail_w  = desk_w  - MARGIN
+    avail_h  = desk_h  - MARGIN
+
+    # Map template is 22 cols × 17 rows – pick the largest square cell that fits
+    MAP_COLS = 22
+    MAP_ROWS = 17
+    cell_from_w = (avail_w - HUD_W) // MAP_COLS
+    cell_from_h = avail_h           // MAP_ROWS
+    CELL = max(24, min(cell_from_w, cell_from_h, 56))   # clamp 24–56 px
+
+    COLS    = (avail_w - HUD_W) // CELL
+    ROWS    = avail_h           // CELL
+    GRID_W  = COLS * CELL
+    SCREEN_W = GRID_W + HUD_W
+    SCREEN_H = ROWS * CELL
 
 # ── Colour palette ──────────────────────────────────────────────────────────
 C_BG         = (15,  17,  26)    # dark background
@@ -87,51 +122,11 @@ RAY_ANGLES_DEG    = [0, 45, 90, 135, 180, 225, 270, 315]   # 360° at 45° steps
 
 
 # ---------------------------------------------------------------------------
-# ─── PREDEFINED MAP ─────────────────────────────────────────────────────────
+# ─── INTERACTION MODES ────────────────────────────────────────────────────
 # ---------------------------------------------------------------------------
-# '.' = open, 'W' = wall, 'S' = start, 'T' = target
-# Grid is COLS × ROWS (22 × 17)
 
-RAW_MAP = """
-......................
-.WWWWWWWW............
-.W......W............
-.W..WW..WWWWWWWWWWW.
-.W..W..............W.
-.W..WWWWWWW.....W..W.
-.W.........W....W..W.
-.W..WWWWW..WWWWWW..W.
-.W..W....W.........W.
-.W..W.WW.WWWWWWWWWW.
-.W..W.W............W.
-.W..W.WWWWWWWWW.WW.W.
-.W..W...........W..W.
-.WWWW.WWWWWWWW.WW..W.
-.S........T.......WW.
-....................W.
-....................W.
-""".strip().splitlines()
-
-# Ensure the map fits our grid (pad / trim)
-def _build_wall_set() -> Set[Tuple[int, int]]:
-    walls: Set[Tuple[int, int]] = set()
-    for row_idx, line in enumerate(RAW_MAP):
-        if row_idx >= ROWS:
-            break
-        for col_idx, ch in enumerate(line):
-            if col_idx >= COLS:
-                break
-            if ch == 'W':
-                walls.add((col_idx, row_idx))
-    return walls
-
-
-def _find_char(ch: str) -> Tuple[int, int]:
-    for row_idx, line in enumerate(RAW_MAP):
-        for col_idx, c in enumerate(line):
-            if c == ch:
-                return (col_idx, row_idx)
-    return (1, 1)
+MODE_OBSTACLE: int = 0   # left-click places obstacles
+MODE_TARGET:   int = 1   # left-click places the target marker
 
 
 # ---------------------------------------------------------------------------
@@ -140,8 +135,9 @@ def _find_char(ch: str) -> Tuple[int, int]:
 
 class SimulationEnv:
     """
-    Manages the 2-D grid world: static walls, dynamic obstacles,
-    start/target positions, and all low-level rendering of the map.
+    Manages the 2-D grid world: border walls only (empty playground),
+    user-placed dynamic obstacles, a fixed start position, and an
+    optional user-defined target that is set by clicking in TARGET mode.
     """
 
     def __init__(self) -> None:
@@ -149,19 +145,36 @@ class SimulationEnv:
         self.rows: int = ROWS
         self.cell: int = CELL
 
-        self.static_walls: Set[Tuple[int, int]] = _build_wall_set()
+        # Start is fixed at top-left quadrant; no predefined obstacles
+        self.start:  Tuple[int, int] = (2, self.rows // 2)
+        self.target: Optional[Tuple[int, int]] = None   # placed by user
+
+        self.static_walls:     Set[Tuple[int, int]] = set()
         self.dynamic_obstacles: Set[Tuple[int, int]] = set()
 
-        self.start:  Tuple[int, int] = _find_char('S')
-        self.target: Tuple[int, int] = _find_char('T')
-
-        # Pre-build border walls
+        # Build border walls only
         for c in range(self.cols):
             self.static_walls.add((c, 0))
             self.static_walls.add((c, self.rows - 1))
         for r in range(self.rows):
             self.static_walls.add((0, r))
-            self.static_walls.add((COLS - 1, r))
+            self.static_walls.add((self.cols - 1, r))
+
+    def set_target(self, col: int, row: int) -> bool:
+        """
+        Place (or move) the target to (col, row).
+        Returns True if the target was actually updated.
+        """
+        if not self.in_bounds(col, row):
+            return False
+        if (col, row) in self.static_walls:
+            return False
+        if (col, row) == self.start:
+            return False
+        # Remove any obstacle that was on this cell first
+        self.dynamic_obstacles.discard((col, row))
+        self.target = (col, row)
+        return True
 
     # ── Helpers ─────────────────────────────────────────────────────────────
 
@@ -186,7 +199,9 @@ class SimulationEnv:
         """
         if (col, row) in self.static_walls:
             return False
-        if (col, row) == self.start or (col, row) == self.target:
+        if (col, row) == self.start:
+            return False
+        if self.target is not None and (col, row) == self.target:
             return False
         if not self.in_bounds(col, row):
             return False
@@ -231,11 +246,12 @@ class SimulationEnv:
         pygame.draw.rect(surface, C_START, s_rect, border_radius=6)
         pygame.draw.rect(surface, (200, 255, 220), s_rect, 2, border_radius=6)
 
-        # Target marker (pulsing ring drawn by Simulation)
-        tc, tr = self.target
-        t_rect = pygame.Rect(tc * CELL + 2, tr * CELL + 2, CELL - 4, CELL - 4)
-        pygame.draw.rect(surface, C_TARGET, t_rect, border_radius=6)
-        pygame.draw.rect(surface, (255, 240, 120), t_rect, 2, border_radius=6)
+        # Target marker (only when user has placed one)
+        if self.target is not None:
+            tc, tr = self.target
+            t_rect = pygame.Rect(tc * CELL + 2, tr * CELL + 2, CELL - 4, CELL - 4)
+            pygame.draw.rect(surface, C_TARGET, t_rect, border_radius=6)
+            pygame.draw.rect(surface, (255, 240, 120), t_rect, 2, border_radius=6)
 
 
 # ---------------------------------------------------------------------------
@@ -508,8 +524,9 @@ class Vehicle:
         # Visual angle (smooth rotation)
         self._draw_angle: float = 0.0
 
-        # Calculate initial path
-        self._recalculate_path()
+        # Only calculate path if a target already exists
+        if self.env.target is not None:
+            self._recalculate_path()
 
     # ── Grid position ────────────────────────────────────────────────────────
 
@@ -520,6 +537,10 @@ class Vehicle:
     # ── Pathfinding ─────────────────────────────────────────────────────────
 
     def _recalculate_path(self) -> None:
+        if self.env.target is None:
+            self.path = []
+            self.halted = True
+            return
         now = time.monotonic()
         if now - self._last_recalc < RECALC_COOLDOWN:
             return
@@ -547,6 +568,10 @@ class Vehicle:
 
     def update(self) -> None:
         if self.reached_target:
+            return
+        # Wait for user to place a target before moving
+        if self.env.target is None:
+            self.sensor.scan(self.px, self.py)   # keep LIDAR active
             return
 
         # ── LIDAR scan ──────────────────────────────────────────────────────
@@ -600,6 +625,8 @@ class Vehicle:
 
     @property
     def distance_to_target(self) -> float:
+        if self.env.target is None:
+            return float('inf')
         tc, tr = self.env.target
         tx, ty = self.env.grid_to_pixel_center(tc, tr)
         return math.hypot(tx - self.px, ty - self.py) / CELL
@@ -680,6 +707,7 @@ class HUD:
         paused: bool,
         fps: float,
         elapsed: float,
+        mode: int = MODE_OBSTACLE,
     ) -> None:
         # ── Sidebar background ──────────────────────────────────────────────
         sidebar = pygame.Rect(GRID_W, 0, HUD_W, SCREEN_H)
@@ -692,7 +720,26 @@ class HUD:
         # Title
         y = self._text(surface, "AUTONAV", x0, y, C_ACCENT, self._font_title)
         y = self._text(surface, "Simulation v1.0", x0, y, C_TEXT_SEC, self._font_small)
-        y += 8
+        y += 6
+
+        # ── Mode badge ──────────────────────────────────────────────────────
+        if mode == MODE_TARGET:
+            badge_col  = C_TARGET
+            badge_text = " TARGET MODE "
+            badge_hint = "Click grid to set target"
+        else:
+            badge_col  = (100, 200, 100)
+            badge_text = " OBSTACLE MODE"
+            badge_hint = "Click grid to place wall"
+        badge_surf = self._font_small.render(badge_text, True, (10, 10, 20))
+        badge_rect = badge_surf.get_rect(topleft=(x0, y))
+        badge_bg   = badge_rect.inflate(6, 4)
+        pygame.draw.rect(surface, badge_col, badge_bg, border_radius=4)
+        surface.blit(badge_surf, badge_rect)
+        y += badge_bg.height + 2
+        y = self._text(surface, f"  {badge_hint}", x0, y, badge_col, self._font_small)
+        y = self._text(surface, "  Press T to toggle", x0, y, C_TEXT_SEC, self._font_small)
+        y += 4
         pygame.draw.line(surface, C_HUD_LINE, (GRID_W + 8, y), (SCREEN_W - 8, y))
         y += 10
 
@@ -716,7 +763,8 @@ class HUD:
 
         section("NAVIGATION")
         dtarget = vehicle.distance_to_target
-        y = self._text(surface, f"  Dist   {dtarget:.2f} cells", x0, y)
+        dist_str = f"{dtarget:.2f} cells" if dtarget != float('inf') else "--"
+        y = self._text(surface, f"  Dist   {dist_str}", x0, y)
         nodes_left = max(0, len(vehicle.path) - vehicle.path_index)
         y = self._text(surface, f"  Nodes  {nodes_left}", x0, y)
         y += 4
@@ -754,14 +802,16 @@ class HUD:
 
         # ── Status flags ────────────────────────────────────────────────────
         section("SYSTEM")
-        halted_col = C_TEXT_ERR if vehicle.halted else C_TEXT_OK
-        halted_str = "HALTED" if vehicle.halted else "MOVING"
-        y = self._text(surface, f"  Vehicle  {halted_str}", x0, y, halted_col)
-
-        if vehicle.reached_target:
-            y = self._text(surface, "  TARGET REACHED!", x0, y, C_TEXT_OK, self._font_big)
-        elif not vehicle.path:
-            y = self._text(surface, "  NO PATH FOUND", x0, y, C_TEXT_ERR)
+        if vehicle.env.target is None:
+            y = self._text(surface, "  WAITING FOR TARGET", x0, y, C_TEXT_WARN)
+        else:
+            halted_col = C_TEXT_ERR if vehicle.halted else C_TEXT_OK
+            halted_str = "HALTED" if vehicle.halted else "MOVING"
+            y = self._text(surface, f"  Vehicle  {halted_str}", x0, y, halted_col)
+            if vehicle.reached_target:
+                y = self._text(surface, "  TARGET REACHED!", x0, y, C_TEXT_OK, self._font_big)
+            elif not vehicle.path:
+                y = self._text(surface, "  NO PATH FOUND", x0, y, C_TEXT_ERR)
 
         paused_col = C_TEXT_WARN if paused else C_TEXT_SEC
         y = self._text(surface, f"  Paused   {'YES' if paused else 'no'}", x0, y, paused_col)
@@ -774,9 +824,11 @@ class HUD:
         # ── Key hints ───────────────────────────────────────────────────────
         section("CONTROLS")
         hints = [
-            ("LClick", "Place obstacle"),
+            ("T",      "Toggle mode"),
+            ("LClick", "Place (mode)"),
             ("RClick", "Clear obstacle"),
-            ("SPACE",  "Pause / Resume"),
+            ("C",      "Clear all obs."),
+            ("SPACE",  "Pause/Resume"),
             ("R",      "Reset vehicle"),
             ("ESC/Q",  "Quit"),
         ]
@@ -791,12 +843,13 @@ class HUD:
         lbl = self._font_small.render("START", True, C_START)
         surface.blit(lbl, (sx + 2, max(2, sy)))
 
-        # Target label
-        tc, tr = vehicle.env.target
-        tx2 = tc * CELL
-        ty2 = tr * CELL - 18
-        lbl2 = self._font_small.render("TARGET", True, C_TARGET)
-        surface.blit(lbl2, (tx2 + 2, max(2, ty2)))
+        # Target label (only when placed)
+        if vehicle.env.target is not None:
+            tc, tr = vehicle.env.target
+            tx2 = tc * CELL
+            ty2 = tr * CELL - 18
+            lbl2 = self._font_small.render("TARGET", True, C_TARGET)
+            surface.blit(lbl2, (tx2 + 2, max(2, ty2)))
 
 
 # ---------------------------------------------------------------------------
@@ -810,6 +863,7 @@ class Simulation:
 
     def __init__(self) -> None:
         pygame.init()
+        _init_display_constants()          # ← detect screen, update globals
         self.screen = pygame.display.set_mode((SCREEN_W, SCREEN_H))
         pygame.display.set_caption("AutoNav – Autonomous Navigation Simulation")
 
@@ -820,6 +874,7 @@ class Simulation:
 
         self.paused  = False
         self.running = True
+        self.mode:   int = MODE_OBSTACLE   # current interaction mode
         self._start_time = time.monotonic()
         self._fps_display: float = 0.0
 
@@ -845,12 +900,29 @@ class Simulation:
                     self.paused = not self.paused
                 elif event.key == pygame.K_r:
                     self._reset_vehicle()
+                elif event.key == pygame.K_t:
+                    # Toggle between obstacle and target-placement mode
+                    self.mode = MODE_TARGET if self.mode == MODE_OBSTACLE else MODE_OBSTACLE
+                elif event.key == pygame.K_c:
+                    # Clear all dynamic obstacles and force repath
+                    self.env.dynamic_obstacles.clear()
+                    self.vehicle.notify_obstacle_placed()
 
-        # Continuous mouse button held
+            elif event.type == pygame.MOUSEBUTTONDOWN:
+                mx, my = event.pos
+                if mx < GRID_W:
+                    col, row = self.env.pixel_to_grid(mx, my)
+                    if event.button == 1 and self.mode == MODE_TARGET:
+                        # Left-click in target mode: place / move target
+                        if self.env.set_target(col, row):
+                            self.vehicle.reached_target = False
+                            self.vehicle._recalculate_path()
+
+        # Continuous left/right mouse held (obstacle placement only)
         mb = pygame.mouse.get_pressed()
-        if mb[0] or mb[2]:
+        if self.mode == MODE_OBSTACLE and (mb[0] or mb[2]):
             mx, my = pygame.mouse.get_pos()
-            if mx < GRID_W:   # only within grid area
+            if mx < GRID_W:
                 col, row = self.env.pixel_to_grid(mx, my)
                 changed = self.env.toggle_obstacle(col, row, add=bool(mb[0]))
                 if changed:
@@ -859,6 +931,8 @@ class Simulation:
     # ── Target pulse ─────────────────────────────────────────────────────────
 
     def _draw_target_pulse(self) -> None:
+        if self.env.target is None:
+            return
         self._pulse = (self._pulse + 0.05) % (2 * math.pi)
         tc, tr = self.env.target
         cx2 = tc * CELL + CELL // 2
@@ -904,6 +978,7 @@ class Simulation:
                 self.paused,
                 self._fps_display,
                 elapsed,
+                self.mode,
             )
 
             # Pause overlay
