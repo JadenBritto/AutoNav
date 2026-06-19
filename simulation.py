@@ -568,9 +568,21 @@ class Vehicle:
             self.path = path
             self.path_index = 1   # skip current cell (index 0)
             self.halted = False
+            # ── Pre-aim heading toward the first waypoint so the forward
+            # sensor cone is correct from frame 1 (avoids false halt when
+            # side obstacles are close but the path leads a different way).
+            self._aim_at_waypoint(path[1])
         else:
             self.path = []
             self.halted = True   # no path available
+
+    def _aim_at_waypoint(self, cell: tuple) -> None:
+        """Point heading (and draw angle) toward a grid cell immediately."""
+        tx, ty = self.env.grid_to_pixel_center(*cell)
+        dx, dy = tx - self.px, ty - self.py
+        if math.hypot(dx, dy) > 0.1:
+            self.heading     = math.degrees(math.atan2(-dy, dx))
+            self._draw_angle = self.heading
 
     def notify_obstacle_placed(self) -> None:
         """Called by Simulation when a dynamic obstacle is placed."""
