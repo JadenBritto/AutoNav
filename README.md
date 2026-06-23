@@ -1,6 +1,6 @@
 # AutoNav – Autonomous Navigation Simulation
 
-A production-grade **autonomous navigation simulation** built with Python + Pygame-CE.
+A **autonomous navigation simulation** built with Python + Pygame-CE.
 
 ---
 
